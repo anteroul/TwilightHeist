@@ -1,4 +1,4 @@
-// Messier 0.7.0: types of the 'messier' module scripts import from. Written by the Messier editor; it's
+// Messier 0.8.0: types of the 'messier' module scripts import from. Written by the Messier editor; it's
 // replaced when the project opens in a different version, so don't edit it.
 
 declare module "messier/engine/math" {
