@@ -1,0 +1,15 @@
+{
+  "format": "messier-project-folder",
+  "version": 1,
+  "name": "Twilight Heist",
+  "startScene": "scenes/Garden.messier",
+  "build": {
+    "title": "Twilight Heist",
+    "scenes": [
+      {
+        "id": "scenes/Garden.messier",
+        "enabled": true
+      }
+    ]
+  }
+}
