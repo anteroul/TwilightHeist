@@ -2443,6 +2443,58 @@ declare module "messier/engine/shadows" {
      */
     export function assignLocalShadows(lights: readonly (LocalShadowLight | null)[], eye: Readonly<Vec3>, viewPlanes: FrustumPlanes, maxLayers: number, mapSize: number): (LocalShadow | null)[];
 }
+declare module "messier/engine/environment" {
+    import type { FrameGraph, TextureHandle } from "messier/engine/frameGraph";
+    /** Faces of the captured sky, in texels: what the prefilter reads, at every mip. */
+    export const ENVIRONMENT_SIZE = 128;
+    /** Faces of the specular cube's first mip; each further mip is the next roughness. */
+    export const SPECULAR_SIZE = 128;
+    /** Mips of the specular cube: roughness 0, 0.2, … 1. mesh.wgsl reads it with this count. */
+    export const SPECULAR_LEVELS = 6;
+    export const IRRADIANCE_SIZE = 32;
+    /** The passes' texture handles in this frame's graph, for the passes that sample them. */
+    export interface EnvironmentHandles {
+        specular: TextureHandle;
+        irradiance: TextureHandle;
+    }
+    export class EnvironmentMaps {
+        private readonly device;
+        /** The prefiltered sky, a cube with SPECULAR_LEVELS mips. */
+        readonly specularView: GPUTextureView;
+        readonly irradianceView: GPUTextureView;
+        /** The BRDF table (r = scale, g = bias to F0), by (N·V, roughness). */
+        readonly brdfView: GPUTextureView;
+        /** Linear, clamped, mipmapped: for the cubes and the table. */
+        readonly sampler: GPUSampler;
+        /** How many times the sky has been baked. */
+        bakes: number;
+        private readonly env;
+        private readonly specular;
+        private readonly irradiance;
+        private readonly capturePipeline;
+        private readonly downsamplePipeline;
+        private readonly prefilterPipeline;
+        private readonly irradiancePipeline;
+        private readonly captureOut;
+        private readonly downsampleGroups;
+        private readonly prefilterGroups;
+        private readonly irradianceGroup;
+        private captureSky;
+        private bakedKey;
+        private bakedTexture;
+        constructor(device: GPUDevice, commonWGSL: string);
+        /**
+         * Whether the sky differs from the one last baked: `key` holds everything the capture reads (the frame's sky values,
+         * without how strongly it lights the scene, which applies when it's read), and `texture` is the image sky's.
+         */
+        needsBake(key: Float32Array, texture: unknown): boolean;
+        /**
+         * Declares the passes that rebake the sky into this frame's graph, and remembers it as baked. The capture reads the
+         * frame uniform and the sky texture through `frame` and `sky` (the frame bind group's).
+         */
+        bake(g: FrameGraph, key: Float32Array, texture: unknown, frame: GPUBuffer, sky: GPUTextureView, skySampler: GPUSampler): EnvironmentHandles;
+    }
+}
 declare module "messier/engine/pipelines" {
     import { type BlendMode, type Material } from "messier/engine/material";
     import type { Mesh } from "messier/engine/mesh";
@@ -2607,8 +2659,11 @@ declare module "messier/engine/renderer" {
         private readonly localShadowData;
         private readonly viewPlanes;
         private frameBindGroup;
-        /** The sky texture `frameBindGroup` was made with (null: the white placeholder). */
+        /** The sky texture `frameBindGroup` was made with (null: the white placeholder), and its view. */
         private frameSky;
+        private frameSkyView;
+        /** The sky prefiltered for image-based lighting (see environment.ts). */
+        private readonly environment;
         private readonly shadowSampler;
         private readonly skySampler;
         /** One per shadow view (SHADOW_SLOTS): its matrix. */
