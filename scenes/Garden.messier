@@ -39,6 +39,12 @@
       "rotation": 0,
       "lighting": 0.35
     },
+    "post": {
+      "antialiasing": "msaa",
+      "bloom": 0,
+      "bloomThreshold": 1,
+      "bloomScatter": 0.7
+    },
     "physics": {
       "gravity": [
         0,

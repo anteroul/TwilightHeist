@@ -886,6 +886,28 @@ declare module "messier/engine/sky" {
         get effectiveMode(): SkyMode;
     }
 }
+declare module "messier/engine/postProcessing" {
+    /**
+     * How the main pass is antialiased. `msaa`: 4× multisampling (sharp, but only geometry edges). `taa`: temporal
+     * antialiasing (one sample per pixel, jittered from frame to frame and blended with the previous frames: smooths
+     * shading and texture shimmer too, slightly softer).
+     */
+    export type Antialiasing = 'msaa' | 'taa';
+    export const ANTIALIASING_MODES: readonly Antialiasing[];
+    /** Fields saved with a scene. Keep in sync with copyFrom(). */
+    export const POST_FIELDS: readonly ["antialiasing", "bloom", "bloomThreshold", "bloomScatter"];
+    /** The scene's post-processing: what happens to the rendered image before it's shown. */
+    export class PostProcessing {
+        antialiasing: Antialiasing;
+        /** Bloom strength: light brighter than the threshold glows over its surroundings. 0 turns bloom off. */
+        bloom: number;
+        /** Brightness (linear, after exposure) where bloom starts, with a soft knee below it. */
+        bloomThreshold: number;
+        /** 0…1: how far the glow spreads (higher reaches farther, with a softer core). */
+        bloomScatter: number;
+        copyFrom(o: PostProcessing): this;
+    }
+}
 declare module "messier/engine/profiler" {
     /** Frames of frame-time history kept for the graph. */
     export const PROFILER_HISTORY = 120;
@@ -1563,7 +1585,7 @@ declare module "messier/engine/serialize" {
     export interface SceneData {
         format: typeof SCENE_FORMAT;
         version: number;
-        /** Environment (ambient, background, exposure, shadow extent), `sky` (Sky fields plus `texture`, a ref) and `physics` ({ gravity, iterations }). */
+        /** Environment (ambient, background, exposure, shadow distance), `sky` (Sky fields plus `texture`, a ref), `post` (PostProcessing fields) and `physics` ({ gravity, iterations }). */
         settings: Json;
         objects: NodeData[];
     }
@@ -1712,6 +1734,7 @@ declare module "messier/engine/scene" {
     import { ScriptLibrary } from "messier/engine/scripting";
     import { Signal } from "messier/engine/signal";
     import { Sky } from "messier/engine/sky";
+    import { PostProcessing } from "messier/engine/postProcessing";
     import type { Json } from "messier/engine/data";
     import type { PrefabLibrary } from "messier/engine/prefab";
     /**
@@ -1870,6 +1893,8 @@ declare module "messier/engine/scene" {
         background: Vec3;
         /** Backdrop and, unless it's a flat color, environment lighting. */
         readonly sky: Sky;
+        /** Antialiasing and bloom. */
+        readonly post: PostProcessing;
         exposure: number;
         /** How far from the camera (world units, along its view) the directional light's shadows reach. */
         shadowDistance: number;
@@ -2322,8 +2347,8 @@ declare module "messier/engine/batching" {
     import type { Mesh } from "messier/engine/mesh";
     import { type Material } from "messier/engine/material";
     import type { MeshRenderer } from "messier/engine/meshRenderer";
-    /** Floats per instance: the Object struct of meshData.wgsl (model, normal matrix). */
-    export const OBJECT_FLOATS = 32;
+    /** Floats per instance: the Object struct of meshData.wgsl (model, normal matrix, previous model). */
+    export const OBJECT_FLOATS = 48;
     /** One instanced draw. */
     export interface MeshBatch {
         mesh: Mesh;
@@ -2350,6 +2375,11 @@ declare module "messier/engine/batching" {
         culled: number;
         /** The distinct materials of the batches (the ones that need their uniforms uploaded). */
         readonly materials: Set<Material>;
+        /**
+         * A renderer's world matrix in the previous frame, for motion vectors (temporal antialiasing). Null, or no
+         * function: it didn't move.
+         */
+        previousWorld: ((r: MeshRenderer) => Readonly<Mat4> | null) | null;
         private readonly viewPlanes;
         private readonly lightPlanes;
         private readonly sorted;
@@ -2510,6 +2540,11 @@ declare module "messier/engine/pipelines" {
         blend: BlendMode;
         /** Null for depth-only passes. */
         colorFormat: GPUTextureFormat | null;
+        /**
+         * Main pass with temporal antialiasing: the second color target, where opaque surfaces write their screen-space
+         * motion (fs_velocity). Null otherwise.
+         */
+        velocityFormat: GPUTextureFormat | null;
         sampleCount: number;
         depthFormat: GPUTextureFormat;
         /** Reversed-Z 'greater' for the main pass, 'less' for shadow maps. */
@@ -2521,8 +2556,11 @@ declare module "messier/engine/pipelines" {
      * pipelines: draw loops, prewarming and tests all go through it.
      */
     export function meshVariantKey(pass: MeshPass, material: Pick<Material, 'doubleSided' | 'alphaCutoff' | 'blend'>, _mesh: Mesh | null, target: RenderTarget): MeshVariantKey;
-    /** Every valid key for these targets: the variants a project can need. Tests build them all. */
-    export function allMeshVariantKeys(targets: Record<MeshPass, RenderTarget>): MeshVariantKey[];
+    /**
+     * Every valid key for these targets (a pass may draw into several: the main pass's MSAA and TAA targets): the variants
+     * a project can need. Tests build them all.
+     */
+    export function allMeshVariantKeys(targets: Record<MeshPass, RenderTarget | readonly RenderTarget[]>): MeshVariantKey[];
     /** What the variants are made of: the WGSL pieces and the bind group layouts the renderer owns. */
     export interface MeshPipelineSources {
         /** Prepended to the main pass shader (frame bindings, skyRadiance). */
@@ -2574,6 +2612,7 @@ declare module "messier/engine/renderer" {
     import { type Draw2D } from "messier/engine/draw2d";
     import { type RenderTarget } from "messier/engine/frameGraph";
     import { MeshPipelines, type MeshPass, type MeshVariantKey } from "messier/engine/pipelines";
+    import type { Antialiasing } from "messier/engine/postProcessing";
     export const MAX_LIGHTS = 128;
     export interface RenderOptions {
         time?: number;
@@ -2607,9 +2646,10 @@ declare module "messier/engine/renderer" {
     }
     /**
      * Forward renderer: shadow passes (a cascade each for one directional light, a layer each for point and spot
-     * lights), a 4x MSAA HDR main pass (lit meshes, the sky), a tonemap pass, then the display-space overlay pass (editor
-     * grid, 2D, overlay helpers) resolved into the canvas. Each frame declares its passes on a FrameGraph, which orders
-     * them and owns their transient textures.
+     * lights), an HDR main pass (lit meshes, the sky; 4x MSAA, or one jittered sample per pixel and a TAA resolve against
+     * the previous frames), bloom, a tonemap pass, then the display-space overlay pass (editor grid, 2D, overlay helpers),
+     * always 4x MSAA, resolved into the canvas. Each frame declares its passes on a FrameGraph, which orders them and owns
+     * their transient textures.
      */
     export class Renderer {
         readonly device: GPUDevice;
@@ -2636,14 +2676,36 @@ declare module "messier/engine/renderer" {
         private readonly overlayDepthPipeline;
         private readonly overlayTopPipeline;
         private readonly mipPipelines;
-        private readonly skyPipeline;
-        private readonly tonemapPipeline;
-        private readonly tonemapLayout;
+        /** The sky into the main pass's targets: 4x MSAA, or one sample with the (unwritten) velocity target for TAA. */
+        private readonly skyPipelines;
+        /** Per sample from the multisampled HDR target (MSAA), or per pixel from the TAA output, writing depth too. */
+        private readonly tonemapPipelines;
         private readonly tonemapBuffer;
-        /** The HDR texture `tonemapGroup` reads (the graph's pool may hand out another one). */
-        private tonemapSource;
-        private tonemapGroup;
         private readonly tonemapData;
+        private readonly taaPipeline;
+        private readonly taaBuffer;
+        private readonly taaData;
+        /** Ping-pong history of the TAA resolve: one is read (the previous frame), the other written. */
+        private history;
+        private historyIndex;
+        /** False until the history holds a frame of the current view (first frame, resize, new scene or camera). */
+        private historyValid;
+        private historyScene;
+        private historyCamera;
+        /** The previous frame's (unjittered) view-projection, for motion vectors. */
+        private readonly prevViewProj;
+        /** Each mesh renderer's world matrix when it was last drawn with TAA, and in which frame. */
+        private readonly prevWorld;
+        private frameCount;
+        private readonly bloomPipelines;
+        private readonly bloomBuffer;
+        private readonly bloomData;
+        /** Linear, clamped: bloom, the TAA history, and bloom's composite. */
+        private readonly clampSampler;
+        /** What the tonemap pass samples when bloom is off. */
+        private readonly blackTextureView;
+        /** Bind groups over transient textures, remade when the pool hands out different ones (see bindGroup()). */
+        private readonly bindGroups;
         private readonly world2DPipeline;
         private readonly screen2DPipeline;
         private readonly frameBuffer;
@@ -2710,8 +2772,30 @@ declare module "messier/engine/renderer" {
         private prepare2D;
         /** Renders one frame. World matrices must be up to date (Scene.updateMatrices). */
         render(scene: Scene, camera: Camera, options?: RenderOptions): RenderStats;
-        /** The attachments the mesh passes draw into, as the frame graph declares them: what mesh variants are made for. */
-        meshTargets(): Record<MeshPass, RenderTarget>;
+        /** Starts temporal antialiasing over from this frame, as after a cut (call when the view jumps). */
+        resetHistory(): void;
+        private readonly previousWorldOf;
+        /** The TAA history textures, at the output size. */
+        private ensureHistory;
+        private releaseHistory;
+        /**
+         * A bind group over textures that can change between frames (transients from the graph's pool, the TAA history):
+         * the one made last time while they're the same, else a new one.
+         */
+        private bindGroup;
+        /**
+         * Declares the bloom passes over `source` (multisampled with MSAA): the prefilter into half resolution, the
+         * downsample chain, then the upsample chain back to half resolution. Returns the result, which the tonemap pass adds.
+         */
+        private addBloom;
+        private drawFullscreen;
+        /** The TAA resolve: this frame's samples blended into the reprojected history (see taa.wgsl). */
+        private drawTaa;
+        /**
+         * The attachments the mesh passes draw into, as the frame graph declares them: what mesh variants are made for. The
+         * main pass's depend on the antialiasing.
+         */
+        meshTargets(antialiasing?: Antialiasing): Record<MeshPass, RenderTarget>;
         /** Every mesh pipeline variant this renderer can need. */
         meshVariantKeys(): MeshVariantKey[];
         /**
@@ -2727,7 +2811,10 @@ declare module "messier/engine/renderer" {
         private drawShadowCasters;
         /** The main pass, as linear radiance: opaque meshes, the sky behind them, then blended meshes back to front. */
         private drawScene;
-        /** The tonemap pass: HDR radiance to display colors, per sample (see tonemap.wgsl). */
+        /**
+         * The tonemap pass: HDR radiance plus bloom to display colors, per sample with MSAA, per pixel from the TAA output
+         * (which also writes `depth` into the display depth). See tonemap.wgsl.
+         */
         private drawTonemap;
         /** The overlay pass, display space: grid, world 2D, depth-tested overlay, screen 2D (HUD), then the overlay on top. */
         private drawDisplay;
@@ -3211,6 +3298,7 @@ declare module "messier/engine/index" {
     export * from "messier/engine/material";
     export * from "messier/engine/light";
     export * from "messier/engine/sky";
+    export * from "messier/engine/postProcessing";
     export * from "messier/engine/transform";
     export * from "messier/engine/component";
     export * from "messier/engine/meshRenderer";
